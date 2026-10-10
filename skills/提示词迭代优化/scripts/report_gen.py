@@ -69,8 +69,13 @@ def evaluate_round(prev_out: str, curr_out: str,
                    prev_issues: list, curr_issues: list,
                    score_before: int, score_after: int,
                    gates: dict, retries: int) -> dict:
-    """给一轮迭代下结论：有效改进 / 结构提升 / 空转 / 退步 / 门禁拦截。"""
-    delta = score_after - score_before
+    """给一轮迭代下结论：有效改进 / 改进 / 部分改善 / 空转 / 引入新问题。
+
+    定性口径 = 诊断问题清单的消长（确定性引擎），与上游一致：
+    迭代质量由问题解决情况与盲评衡量，不使用结构分 delta。
+    （score_before/score_after 仅作内部诊断入参，不参与定性。）
+    """
+    issue_delta = len(curr_issues or []) - len(prev_issues or [])
     solved = [i for i in (prev_issues or []) if i not in (curr_issues or [])]
     added = [i for i in (curr_issues or []) if i not in (prev_issues or [])]
 
@@ -79,16 +84,16 @@ def evaluate_round(prev_out: str, curr_out: str,
     vague_killed = sorted(v_prev - v_curr)
     vague_new = sorted(v_curr - v_prev)
 
-    if delta > 0 and (curr_issues == [] or len(curr_issues) < len(prev_issues or [])):
+    if curr_issues == [] and solved:
         verdict, tone = "有效改进", "good"
-    elif delta > 0:
-        verdict, tone = "结构提升（仍有剩余问题）", "good"
-    elif delta == 0 and (curr_issues or []) == (prev_issues or []) and not solved:
-        verdict, tone = "空转（幂等，未带来变化）", "warn"
-    elif delta < 0:
-        verdict, tone = "退步", "bad"
+    elif solved and not added:
+        verdict, tone = "改进（仍有剩余问题）", "good"
+    elif added and not solved:
+        verdict, tone = "引入新问题", "bad"
+    elif solved and added:
+        verdict, tone = "部分改善", "warn"
     else:
-        verdict, tone = "局部调整", "warn"
+        verdict, tone = "空转（幂等，未带来变化）", "warn"
 
     reasons = []
     if solved:
@@ -99,8 +104,8 @@ def evaluate_round(prev_out: str, curr_out: str,
         reasons.append("模糊词减少：" + "、".join(vague_killed))
     if vague_new:
         reasons.append("⚠ 模糊词增加：" + "、".join(vague_new))
-    if delta < 0 and vague_new:
-        reasons.append("退步主因疑似：新增内容引入了模糊词（先查规则器假阳性再改稿）")
+    if added and vague_new:
+        reasons.append("疑似主因：新增内容引入了模糊词（先查规则器假阳性再改稿）")
     if retries:
         reasons.append(f"本轮重派 {retries} 次后才通过门禁")
     gates_failed = [k for k, v in (gates or {}).items() if v != "PASS"]
@@ -108,7 +113,7 @@ def evaluate_round(prev_out: str, curr_out: str,
         reasons.append("门禁失败：" + "、".join(gates_failed))
 
     return {
-        "verdict": verdict, "tone": tone, "delta": delta,
+        "verdict": verdict, "tone": tone, "delta": issue_delta,
         "solved": solved, "added": added,
         "vague_killed": vague_killed, "vague_new": vague_new,
         "reasons": reasons,
@@ -212,16 +217,37 @@ def build(rundir: str, out_path: str | None = None) -> str:
     blinds = state.get("blind_reviews") or []
     if not blinds and state.get("blind_review"):
         blinds = [state["blind_review"]]
+    # 修 2026-10-10 既有瑕疵：verdict/low_dims 写入发生在 blind_reviews append
+    # 之后（浅拷贝快照不回传），报告读到的 verdict 恒为空。从最新的
+    # state["blind_review"] 回填最后一条（两者总是同一轮盲评）。
+    _last_br = state.get("blind_review") or {}
+    if blinds and _last_br.get("verdict") and not blinds[-1].get("verdict"):
+        blinds[-1]["verdict"] = _last_br["verdict"]
+        if _last_br.get("low_dims") and not blinds[-1].get("low_dims"):
+            blinds[-1]["low_dims"] = _last_br["low_dims"]
 
-    base_score = state["baseline"]["score"]
-    final_score = hist[-1]["score_after"] if hist else base_score
+    base_issues = state["baseline"].get("issues") or []
+    final_issues = hist[-1]["issues"] if hist else base_issues
+
+    # 盲评质量分（LLM-as-judge，对齐上游 evaluation 机制）：取最近一次盲评的综合分。
+    # 这是全系统对外的唯一分数——与上游一致（上游唯一评分机制即 LLM 评审
+    # 0-100 + overall）。结构要素分只是确定性 issues 引擎的内部衬底，
+    # 上游无对应机制，不作为分数呈现（2026-10-10 一致性改造）。
+    blind_final, blind_verdict = None, None
+    for br in reversed(blinds):
+        if br.get("blind_score") is not None:
+            blind_final = br["blind_score"]
+            blind_verdict = br.get("verdict", "—")
+            break
+    blind_src = (blinds[-1].get("blind_score_source") if blinds else None) \
+        if blinds else None
+
     gate = rep.get("gate", "—")
     checks = (rep.get("delivery_gate") or {}).get("checks", [])
 
-    chip = []
-    for h in hist:
-        d = h["delta"]
-        chip.append((f"r{h['round']}", h["score_after"], d))
+    blind_chip = [(f"盲评{i}", br.get("blind_score"))
+                  for i, br in enumerate(blinds, 1)
+                  if br.get("blind_score") is not None]
 
     # ---- 每轮改进卡 ----
     round_cards = []
@@ -248,7 +274,7 @@ def build(rundir: str, out_path: str | None = None) -> str:
         added_html = "".join(f'<li class="badli">{esc(s)}</li>' for s in ev["added"]) \
             or '<li class="muted">无</li>'
         reasons_html = "".join(f"<li>{esc(r)}</li>" for r in ev["reasons"]) \
-            or '<li class="muted">分数与问题数均无变化</li>'
+            or '<li class="muted">问题清单无变化</li>'
 
         lat = h.get("fulfil_latency_sec")
         lat_html = (f'{lat}s' if lat is not None else "—")
@@ -262,12 +288,11 @@ def build(rundir: str, out_path: str | None = None) -> str:
   <h3>第 {h['round']} 轮 · {esc(h.get('seam',''))}
       <span class="badge {_tone(ev['tone'])}">{esc(ev['verdict'])}</span></h3>
   <div class="kv">
-    <span>分数 <b>{h['score_before']}</b> → <b>{h['score_after']}</b>
+    <span>问题 <b>{len(prev_issues)}</b> → <b>{len(h['issues'])}</b> 条
       （{'+' if ev['delta'] >= 0 else ''}{ev['delta']}）</span>
     <span>字符 {len(curr_out)}（{'+' if ev['char_delta'] >= 0 else ''}{ev['char_delta']}）</span>
     <span>剩余问题 {len(h['issues'])}</span>
     <span>门禁 G7 {_gate_badge(h.get('gates',{}).get('G7','—'))}
-          G8 {_gate_badge(h.get('gates',{}).get('G8','—'))}
           G9 {_gate_badge(h.get('gates',{}).get('G9','—'))}</span>
     <span>任务卡→产出 间隔 {lat_html} {lat_note}</span>
   </div>
@@ -319,7 +344,8 @@ def build(rundir: str, out_path: str | None = None) -> str:
   <h3>第 {i} 次盲评 · 轮次 r{br.get('round','—')}
       <span class="badge {cls}">{esc(verdict)}</span>
       <span class="badge {'ok' if not cf else 'bad'}">冲突 {len(cf)} 条</span></h3>
-  <div class="kv"><span>综合分 <b>{br.get('blind_score','—')}</b></span>
+  <div class="kv"><span>综合分 <b>{br.get('blind_score','—')}</b>
+    <span class="muted">（{'judge overall' if br.get('blind_score_source') == 'overall' else ('各维平均回退' if br.get('blind_score_source') else '口径未记录，按均值展示')}）</span></span>
     <span>产出文件 {esc(br.get('judge_file') or '—')}</span>
     <span>归档 {esc(br.get('archive') or '—')}</span>
     <span>卡→产出 间隔 {br.get('fulfil_latency_sec','—')}s</span></div>
@@ -342,9 +368,27 @@ def build(rundir: str, out_path: str | None = None) -> str:
         f'<td>{_gate_badge(c.get("status"))}</td><td>{esc(c.get("detail"))}</td></tr>'
         for c in checks) or '<tr><td colspan="4" class="muted">未跑全量门禁</td></tr>'
 
-    trajectory = "".join(
-        f'<span class="chip">{esc(n)} · <b>{v}</b> '
-        f'({"+" if d >= 0 else ""}{d})</span>' for n, v, d in chip)
+    blind_traj = "".join(
+        f'<span class="chip" style="background:#dcfce7">{esc(n)} · '
+        f'<b>{v}</b>（质量分）</span>' for n, v in blind_chip) \
+        or '<span class="muted">暂无盲评记录（盲评在收敛后进行）</span>'
+    # 质量收敛层标注：目标线 / 危险线 / 历史最优轮（数据来自 state.quality_target
+    # 与逐次 blind_reviews，全部脚本留档，无手工填写）
+    qt = state.get("quality_target")
+    _scores_all = [b.get("blind_score") for b in blinds
+                   if b.get("blind_score") is not None]
+    if _scores_all:
+        _best_i = max(range(len(_scores_all)), key=lambda i: _scores_all[i])
+        blind_traj += (
+            f'<div class="sub" style="margin-top:6px">'
+            + (f'质量目标 <b>{qt}</b> · ' if qt else '')
+            + f'危险线（单维）{60} · '
+            + f'历史最优 <b>{_scores_all[_best_i]}</b>'
+            + f'（盲评{_best_i + 1}，产物见其对应 fulfil/roundN.txt）'
+            + (f' · <b style="color:{"var(--ok)" if blind_final is not None and qt and blind_final >= qt else "var(--bad)"}">'
+               f'{"达标" if blind_final is not None and qt and blind_final >= qt else "未达标"}</b>'
+            if qt else '')
+            + '</div>')
 
     raw_txt = _t(os.path.join(rundir, "raw.md")) or state.get("raw", "")
     final_txt = state.get("last_final", "") or (hist[-1]["output"] if hist else "")
@@ -423,17 +467,23 @@ footer{{color:var(--mut);font-size:12px;margin-top:40px;text-align:center}}
  · 模板 <code>{esc(state.get('template'))}</code></div>
 
 <div class="card hero">
-  <div><div class="sub">基线 → 终稿</div>
-    <div class="big">{base_score} <span class="muted">→</span> {final_score}</div>
-    <div class="sub">提升 {final_score - base_score} 分 · 共 {len(hist)} 轮改写
-      · {len(blinds)} 次盲评</div></div>
-  <div>{_score_chart([('基线', base_score)] + chip)}</div>
+  <div><div class="sub">盲评质量分（LLM-as-judge · 0-100）</div>
+    <div class="big">{'—' if blind_final is None else blind_final}</div>
+    <div class="sub">verdict {esc(blind_verdict or '—')}
+      · {'judge overall' if blind_src == 'overall' else ('各维平均回退' if blind_src else '—')}
+      · 共 {len(blinds)} 次盲评
+      · {'质量目标 ' + str(qt) if qt else '质量门禁未启用'}</div></div>
+  <div><div class="sub">诊断问题数（确定性引擎 · 收敛=清零）</div>
+    <div class="big">{len(base_issues)} <span class="muted">→</span> {len(final_issues)}</div>
+    <div class="sub">问题清单消长是迭代定性口径；质量结论以盲评为准</div></div>
+  <div>{_score_chart(blind_chip)}</div>
   <div><div class="sub">交付门禁</div>
     <div class="big"><span class="badge {'ok' if gate == 'PASS' else 'bad'}">{esc(gate)}</span></div>
     <div class="sub">{len(checks)} 项检查</div></div>
 </div>
 
-<div class="card"><h3>分数轨迹</h3>{trajectory}</div>
+<div class="card"><h3>盲评质量分轨迹<span class="sub">（LLM-as-judge · 0-100，
+  对齐上游唯一评分机制 evaluation/content.ts）</span></h3>{blind_traj}</div>
 
 <h2>一、交付门禁 G1–G10</h2>
 <div class="card"><table>
@@ -457,7 +507,8 @@ footer{{color:var(--mut);font-size:12px;margin-top:40px;text-align:center}}
     <pre class="raw">{esc(final_txt)}</pre></details>
 </div>
 
-<footer>由 scripts/report_gen.py 确定性生成 · 全部判定来自脚本与留痕文件，无模型推断</footer>
+<footer>由 scripts/report_gen.py 确定性生成 · 门禁/诊断来自脚本留痕，无模型推断；
+质量分（盲评）来自独立 judge 子代理留痕（对齐上游 LLM-as-judge 机制）</footer>
 </div></body></html>"""
 
     out = out_path or os.path.join(rundir, "report.html")

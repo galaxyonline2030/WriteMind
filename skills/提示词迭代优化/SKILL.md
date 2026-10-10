@@ -38,6 +38,11 @@ v2.1 引擎换位：**确定性引擎只做前处理（诊断+patchPlan）与后
    0 = 可交付，1 = 回修。
 5. **issues 回灌**：每轮迭代的"新需求"由上轮剩余 issues 自动转为 patchPlan（修 B4）；
    盲评 blocking_conflicts 亦回灌为一次有界返工（二次冲突 → FAIL）。
+6. **两层收敛（v2 增强 #6，2026-10-10）**：结构层（issues 清零 + 无 blocking_conflicts）
+   **且** 质量层（盲评分 ≥ `--min-blind-score` 目标线 且 无单维 < 60 危险线）。
+   未达标 → judge weaknesses/patchPlan 回灌为**质量返工**（受 `--quality-reworks`
+   上限保护，返工后无改善即 plateau 提前停）；耗尽仍未达标 → **FAIL**（与二次冲突
+   对称，不允许带病交付）。阈值默认 85 为**临时值**（校准 n=1），传 0 关闭质量门禁。
 6. `scripts/` 内绝不 import / 调用任何 LLM SDK。
 
 ## 3. 工作流（三段式乒乓协议 + 强制盲评）
@@ -61,14 +66,14 @@ v2.1 引擎换位：**确定性引擎只做前处理（诊断+patchPlan）与后
    **`AWAIT_FULFILL` 两个 L**）；或重新起一个 run。
    当前进度随时用 `--status` 看：`round=X/Y`。
 2. **Phase A（脚本）**：`cd scripts && python run_pipeline.py "@raw.txt" system 2 general`
-   → 诊断、基线分、patchPlan、路由模板 → 写 `runs/<ts>/state.json` → **exit 10**。
+   → 诊断、patchPlan、路由模板 → 写 `runs/<ts>/state.json` → **exit 10**。
 3. **派发 fulfil 子代理（结构性触点①）**：
    `python run_pipeline.py --dispatch runs/<ts>` → 渲染自包含任务卡
    `dispatch/roundN.md` → 用 **Agent 工具 spawn 独立子代理**，把任务卡**原文**交给
    它执行（第 1 轮 informed 改写；第 2 轮起 iterate_directed 融合修改）→ 子代理把
    终稿写入 `runs/<ts>/fulfil/roundN.txt`。主代理不得代写。
 4. **Phase B（脚本）**：`python run_pipeline.py --resume runs/<ts>` → fulfil 注入 realizer
-   → 契约校验 → G7/G8/G9 → evaluate/compare → 收敛判定：
+   → 契约校验 → G7/G9 → evaluate/compare → 收敛判定：
    - issues 清零 → 进入 **AWAIT_JUDGE** → **exit 10**（走第 5 步盲评）
    - 仍有 issues 且未达上限 → 回灌为第 N+1 轮 patchPlan → **exit 10**（回到第 3 步）
    - delta 停滞（连续 2 轮 < 5）或轮数耗尽仍有 issues → **exit 1**
@@ -76,12 +81,16 @@ v2.1 引擎换位：**确定性引擎只做前处理（诊断+patchPlan）与后
    `--dispatch runs/<ts>` → 渲染 `dispatch/judge.md` → 用 Agent 工具 spawn 一个
    **全新的、无本会话上下文**的子代理（只看终稿文本，无原始稿/历史/分数）→
    judge 把评审 JSON 写入 `runs/<ts>/fulfil/judge.json` → `--resume` 裁决：
-   - `blocking_conflicts` 为空 → G10 PASS → 全量 G1–G10 门禁 → **exit 0**（可交付）
+   - `blocking_conflicts` 为空且盲评达标（≥ 目标线且无 <60 低维）→ G10 PASS →
+     全量 G1–G10 门禁 → **exit 0**（可交付）
    - 有冲突且未返工过 → 冲突 + judge patchPlan 回灌，配额 +1，**exit 10**（回到第 3 步）
    - 返工后二次冲突 → **exit 1**（不允许带病交付）
+   - 无冲突但盲评未达标 → **质量返工**：weaknesses/patchPlan 回灌（返工卡附
+     judge 弱点背景），配额 +1，**exit 10**（回到第 3 步）；返工次数耗尽或
+     分数无改善（plateau）→ **exit 1**（verdict=BELOW_TARGET，报告标注历史最优轮）
 6. **重派**：接缝契约或门禁失败 → 脚本附反馈 exit 10，主代理把它并入重新渲染的
    任务卡再派子代理；每轮上限 3 次，耗尽 exit 1。
-7. **交付**：终稿 + report.json 摘要（分数轨迹、剩余 issues、门禁明细、盲评结论）。
+7. **交付**：终稿 + report.json 摘要（剩余 issues、门禁明细、盲评结论）。
 8. **真实用例验收（强制）**：宣告完成前，必须拿 ≥1 个真实输入跑一遍终稿，把输出留档
    到 run 目录并向用户展示。脚本层只能提醒，无法代劳——这是最后的质量关口。
 9. **生成可视化报告（v2.2 起）**：`python run_pipeline.py --report runs/<ts>`
@@ -96,6 +105,9 @@ v2.1 引擎换位：**确定性引擎只做前处理（诊断+patchPlan）与后
 cd scripts
 # 三段式协议（主路径；子代理触点①②均为 --dispatch + Agent 工具 spawn）
 python run_pipeline.py "@raw.txt" system 2 general   # Phase A → exit 10
+# 可选 flag：--min-blind-score N（质量目标，默认 85 临时值，0=关闭）
+#            --quality-reworks N（质量返工上限，默认 1）
+python run_pipeline.py "@raw.txt" user 3 professional --min-blind-score 85
 python run_pipeline.py --dispatch runs/<ts>          # 渲染子代理任务卡 → exit 10
 python run_pipeline.py --resume runs/<ts>            # Phase B / 盲评裁决 → 0 / 10 / 1
 python run_pipeline.py --status  runs/<ts>
@@ -122,11 +134,10 @@ python optimize_cli.py informed|iterate|redteam ...
 | G4/G5 | 剩余 issues 清零 / 分数确实提升（winner=after 且 delta>0） |
 | G6 | 非通用模板产物（不得等于 rewrite_stub 空壳） |
 | G7 | 自洽性 lint：互斥约束（"一句话" vs "五个部分"、禁止输出 vs 要求输出、元约束失效） |
-| G8 | 关键信息保持：原文数字/量词与引述要求不丢失 |
 | G9 | 变量完整性：原文全部 {{var}} 逐字保留（对齐原项目 iterate 自检） |
-| G10 | 盲评已通过：独立无上下文 judge 子代理 verdict=PASS（协议模式强制；legacy 记 SKIP） |
+| G10 | 盲评已通过：独立无上下文 judge 子代理 verdict=PASS，且（若启用质量目标）盲评分 ≥ 目标线且无单维 <60 低维（协议模式强制；legacy 记 SKIP） |
 
-已知回归：`examples/false_positive_demo.txt` 必须被 G7/G6/G5 拦截（exit 1）。
+已知门禁：互斥约束样例（"一句话" vs "五个部分"）须被 G7 拦截（exit 1）；变量丢失须被 G9 拦截。
 
 ## 6. 模板路由（templates/，移植自原项目模板家族）
 
@@ -137,7 +148,7 @@ python optimize_cli.py informed|iterate|redteam ...
 | system | format | optimize_output_format.md | output-format-optimize.ts |
 | user | basic / planning / professional | user_optimize_*.md | user-prompt-* 三档 |
 | 第 2 轮起 | — | iterate_directed.md | iterate.ts v3.0.0 |
-| 按需 | 深度评审 | evaluation_judge.md | evaluation/content.ts v5.0 |
+| 按需 | 深度评审 | evaluation_judge.md | evaluation/content.ts（develop；每维 0-100 + overall） |
 | 按需 | 评估后改写 | evaluation_rewrite.md | evaluation-rewrite/generic.ts |
 | 按需 | 红队审稿 | redteam_review.md | README 演示显式化（v2 净增强） |
 | 按需 | 变量抽取 | variable_extract.md | variable-extraction/extraction.ts |
@@ -171,13 +182,12 @@ prompt-optimizer/
   scripts/
     contract.py             结果契约（11 形状，含 SHAPE_BLIND_REVIEW）
     virtual_llm_client.py   接缝内核（call/chat/memoize/realizer）
-    stubs.py                确定性规则器 + G7/G8/G9 + patchPlan 构造
+    stubs.py                确定性规则器 + G7/G9 + patchPlan 构造
     optimizer_adapter.py    渲染 + 全部接缝（模板装载与路由、judge 消息）
     run_pipeline.py         协议编排器（--dispatch / AWAIT_JUDGE / exit 10/0/1）
     report_gen.py           可视化报告生成器（--report，确定性，零 LLM）
     verify_delivery.py      G1–G10 交付门禁
     optimize_cli.py         命令行入口
-  examples/                 before_after + false_positive_demo（回归）
   runs/                     每次运行留档（state/report 可复现）
                             ├ dispatch/  每轮子代理任务卡
                             ├ fulfil/    每轮子代理产出 + judge_r<N>.json 盲评归档
@@ -201,9 +211,9 @@ prompt-optimizer/
 
 | 区块 | 内容 |
 |------|------|
-| 总览 | 基线→终稿分数轨迹（SVG）、G1–G10 门禁表、结论徽标 |
+| 总览 | **盲评质量分（LLM-as-judge · 0-100，全系统唯一对外分数，对齐上游 evaluation/content.ts）**、诊断问题数轨迹（收敛=清零）、G1–G10 门禁表、结论徽标 |
 | 每轮改进 | 分数/字符变化、**改前→改后 diff**、本轮 patchPlan、**改进评价**（有效改进 / 结构提升 / 空转 / 退步）、已消除与新增的问题、门禁 G7–G9 |
-| 独立盲评 | 逐次盲评的评分条、优点/缺点、blocking_conflicts、patchPlan、综合分 |
+| 独立盲评 | 逐次盲评的评分条（每维 0-100）、优点/缺点、blocking_conflicts、patchPlan、综合分（judge overall 优先，缺失回退各维平均并标注口径） |
 | 运行跟踪 | 每轮**可复跑的脚本命令**、派发时刻、**子代理任务卡原文**、**子代理产出原文**、卡→产出间隔（<1s 会告警"疑似非子代理执行"） |
 | 原文/终稿 | 两版全文对照 |
 

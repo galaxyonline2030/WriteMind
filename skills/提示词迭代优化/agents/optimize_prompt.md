@@ -11,13 +11,15 @@
 Phase A（exit 10）
   → 主代理: --dispatch → dispatch/roundN.md
   → 子代理①(Fulfil): 按卡改写 → fulfil/roundN.txt
-Phase B（--resume: 接缝+契约+G7/G8/G9+评估）
+Phase B（--resume: 接缝+契约+G7/G9+评估）
   → 收敛 → AWAIT_JUDGE（exit 10）
   → 主代理: --dispatch → dispatch/judge.md
   → 子代理②(Judge): 只看终稿 → fulfil/judge.json
 Resume（盲评裁决）
-  → 无冲突 → G10 PASS 交付
+  → 无冲突且盲评达标（≥目标线且无<60低维）→ G10 PASS 交付
   → 有冲突 → 一次有界返工（回到子代理①）；二次冲突 → FAIL
+  → 无冲突但未达标 → 质量返工（weaknesses/patchPlan 回灌，≤--quality-reworks 次，
+    默认 1；分数无改善 plateau 提前停）；耗尽未达标 → FAIL（BELOW_TARGET）
 ```
 
 ---
@@ -48,7 +50,7 @@ Resume（盲评裁决）
 
 ### 被重派时（retries 1-3 / 3）
 
-- 脚本在 `--resume` 输出中给出具体失败反馈（G7 互斥冲突 / G8 丢失信息 /
+- 脚本在 `--resume` 输出中给出具体失败反馈（G7 互斥冲突 /
   G9 缺失变量 / 契约错误），主代理把它追加到重新渲染的任务卡尾部传给子代理。
 - 子代理按反馈**覆盖写入同一个 fulfil 文件**，主代理重跑 `--resume`。
 - 3 次耗尽 → exit 1，向用户如实报告，不得降级交付。
@@ -70,8 +72,11 @@ judge 只看到 `dispatch/judge.md` 里那段终稿文本——没有原始稿�
    问题逐条列出；没有则 `[]`。这是 G10 门禁的裁决字段。
 4. **只把 JSON 本体**写入 `runs/<ts>/fulfil/judge.json`（不要附加解释），
    回复一行 `DONE` 后立即结束。
-5. 判卷后果由脚本裁决：无冲突 → G10 PASS；有冲突 → 一次有界返工回灌
-   （judge 的 patchPlan 一并注入下一轮 patchPlan）；返工后二次冲突 → FAIL。
+5. 判卷后果由脚本裁决：无冲突且盲评达标（overall ≥ 质量目标线，且无单维
+   <60）→ G10 PASS；有冲突 → 一次有界返工回灌（judge 的 patchPlan 一并注入
+   下一轮 patchPlan）；返工后二次冲突 → FAIL；无冲突但未达标 → 质量返工
+   （weaknesses/patchPlan 回灌，受 `--quality-reworks` 上限保护），耗尽或
+   分数无改善 → FAIL（BELOW_TARGET）。
 
 ---
 

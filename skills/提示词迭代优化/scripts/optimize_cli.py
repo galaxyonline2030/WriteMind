@@ -6,8 +6,8 @@
   python optimize_cli.py patchplan "@prompt.txt"                 # issues → 改写指令
   python optimize_cli.py lint      "@prompt.txt"                 # G7 自洽性检查
   python optimize_cli.py vars      "@prompt.txt"                 # {{var}} 正则抽取
-  python optimize_cli.py evaluate  "@prompt.txt"                 # 打分 0-100
-  python optimize_cli.py compare   "@before.txt" "@after.txt"    # 前后对比
+  python optimize_cli.py evaluate  "@prompt.txt"                 # 结构诊断分（内部衬底，非上游机制；质量分以盲评为准）
+  python optimize_cli.py compare   "@before.txt" "@after.txt"    # 前后结构诊断对比（同上）
 
 生成式接缝命令（agent-first：无 realizer 时抛 AgentRealizationRequired）：
   python optimize_cli.py optimize  "@prompt.txt" [mode]          # stub 冒烟用（v1 兼容）

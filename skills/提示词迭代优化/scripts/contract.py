@@ -110,8 +110,46 @@ SHAPE_REDTEAM_REVIEW = JsonContract(
 )
 # 变量抽取：对齐原项目 variable-extraction 的 JSON 契约
 SHAPE_VARIABLES = JsonContract("variables", required=["variables"])
+
+
+class BlindReviewContract(JsonContract):
+    """盲评 judge 结论契约（对齐上游 evaluation/content.ts 的分值契约）。
+
+    上游（develop 分支）每维分值显式 <0-100> 且带整体 overall 字段；
+    本地曾在模板里不写分值范围、也不校验，导致 judge 自猜刻度、
+    0-10 与 0-100 产出混用（2026-10-09 对比上游源码后修正）。
+    """
+
+    LO, HI = 0.0, 100.0
+
+    def validate(self, result: Any) -> Any:
+        result = super().validate(result)
+        scores = result.get("scores")
+        if not isinstance(scores, dict) or not scores:
+            raise ContractViolation(
+                self.name, "scores 必须是非空 dict（各维 0-100 数值）")
+        for k, v in scores.items():
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ContractViolation(
+                    self.name, f"scores.{k} 期望数值，实际 {v!r}")
+            if not (self.LO <= float(v) <= self.HI):
+                raise ContractViolation(
+                    self.name,
+                    f"scores.{k}={v} 超出 [0,100]（分值契约对齐上游 "
+                    f"content.ts：每维 0-100；0-10 刻度会被拒收）")
+        overall = result.get("overall")
+        if overall is not None:
+            if isinstance(overall, bool) or not isinstance(overall, (int, float)) \
+                    or not (self.LO <= float(overall) <= self.HI):
+                raise ContractViolation(
+                    self.name,
+                    f"overall={overall!r} 必须是 0-100 数值（对齐上游 overall 语义）")
+        return result
+
+
 # 盲评 judge：独立无上下文子代理只看终稿文本给出的评审（C3 独立性）
-SHAPE_BLIND_REVIEW = JsonContract(
+# 分值契约：scores 各维 0-100 + 可选 overall 0-100（对齐上游 evaluation/content.ts）
+SHAPE_BLIND_REVIEW = BlindReviewContract(
     "blind_review",
     required=["summary", "scores", "strengths", "weaknesses", "patchPlan",
               "blocking_conflicts"],

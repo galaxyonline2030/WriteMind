@@ -157,7 +157,14 @@ def vague_hits_en(text: str) -> set:
 
 
 def _structure_score(prompt: str) -> int:
-    """规则化结构分：越结构化、越具体，分越高（双语正则）。"""
+    """内部确定性衬底：结构要素分（双语正则，地板 60 / 满分 96）。
+
+    ⚠ 定位（2026-10-10 一致性改造）：上游 linshenkx/prompt-optimizer
+    没有任何对应机制（其唯一评分 = LLM-as-judge evaluation，0-100 + overall）。
+    本函数只服务于 analyze/compare 的 issues 引擎与内部诊断，
+    **禁止**作为质量分输出到日志、报告或对外口径——质量分的唯一来源
+    是盲评 judge 子代理（templates/evaluation_judge.md）的 0-100 / overall。
+    """
     score = 60  # 基线
     if len(prompt) >= 40:
         score += 8
@@ -279,8 +286,11 @@ def subagent_realizer(client, messages: List[Message], shape) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# v2 规则器（DEEP_ANALYSIS_AND_PLAN.md §4）：G7 自洽 / G8 信息保持 / G9 变量完整
+# v2 规则器（DEEP_ANALYSIS_AND_PLAN.md §4）：G7 自洽 / G9 变量完整
 # 定位 = 下限检查器；语义级矛盾仍由 evaluation_judge（生成式）兜底
+# G8 信息保持已于 2026-10-10 对抗评估后移除：对自然语言草稿类输入恒返回空
+# （无数字/引号锚点可丢），且不校验「用户需求是否被静默丢弃」，实测对语义
+# 漂移全漏，属无效护栏——真正的语义守护应交给 G10 盲评（建议加软阈值）。
 # ---------------------------------------------------------------------------
 # 互斥约束规则（G7 自洽 linter，修 A1）：每条 = (正则A, 正则B, 说明)
 # 注意：第 1 条「禁止输出 vs 要求输出」已下沉为带范围判定的 _negation_is_global()，
@@ -360,7 +370,7 @@ def _negation_is_global(prompt: str) -> bool:
 def consistency_lint(prompt: str) -> List[str]:
     """G7：互斥约束启发式检查。返回冲突说明列表（空 = 通过）。
 
-    已知覆盖：false_positive_demo（"只输出一句话"+"包含五个部分"+"不要输出任何内容"）。
+    已知覆盖：「只输出一句话」+「包含五个部分」+「不要输出任何内容」类互斥（A1 启发式）。
     语义级自相矛盾不在规则覆盖内，由 evaluation_judge 的自洽清单兜底。
     """
     conflicts: List[str] = []
@@ -376,38 +386,6 @@ def consistency_lint(prompt: str) -> List[str]:
     ):
         conflicts.append("自洽性冲突：约束可被自主忽略，等同无约束")
     return conflicts
-
-
-_NUM_RE = re.compile(r"\d+(?:\.\d+)?%?|[一二三四五六七八九十百千]+(?:个|条|项|字|页|份|次)")
-# G8 锚点例外：冠词性「一个/一名」不携带可保持的信息量（"是一个写作助手"→
-# "专业写作助手"是合法改写）。实测 2026-10-07 E2E 发现的 A1 同类假阳性。
-_NUM_ANCHOR_EXCEPTIONS = {"一个", "一名"}
-_QUOTE_RE = re.compile(r"[“「『\"']([^”」』\"']{2,})[”」』\"']")
-
-
-def extract_key_tokens(text: str) -> Dict[str, List[str]]:
-    """G8 前置：抽取原文中的关键信息锚点（数字/量词、引号串）。"""
-    return {
-        "numbers": sorted(set(_NUM_RE.findall(text or ""))
-                          - _NUM_ANCHOR_EXCEPTIONS),
-        "quotes": sorted(set(m for m in _QUOTE_RE.findall(text or "") if len(m) >= 2)),
-    }
-
-
-def info_retention_missing(before: str, after: str) -> List[str]:
-    """G8：关键信息保持检查。返回丢失项列表（空 = 通过）。
-
-    只校验硬锚点（数字/量词与引号串）——改写允许换措辞，但不得丢数字、丢引述要求。
-    """
-    tokens = extract_key_tokens(before)
-    missing: List[str] = []
-    for n in tokens["numbers"]:
-        if n not in after:
-            missing.append(f"关键数字/量词「{n}」在终稿中丢失")
-    for q in tokens["quotes"]:
-        if q not in after:
-            missing.append(f"引述要求「{q}」在终稿中丢失")
-    return missing
 
 
 # 修 A9（2026-10-07 实战发现）：原正则只认 ASCII 变量名，{{简历原文}}、{{目标岗位JD}}

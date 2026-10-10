@@ -14,7 +14,7 @@
 | 4 | 迭代 | `iterate/iterate.ts` v3.0.0：**定向融合**语义（修改原稿而非执行需求）+ 3 个 few-shot 反例 + 变量输出前自检；输入 JSON `{lastOptimizedPrompt, iterateInput}`；MCP `iterate-prompt` 同链路 | `templates/iterate_directed.md` 忠实移植同语义；iterateInput 自动 = 剩余 issues 的 patchPlan（兼容用户手动需求）；**每轮过 G 门禁** | 对齐＋增强 | 迭代语义本就是"修改原稿"，v2 忠实移植且门禁每轮强制 |
 | 5 | 评估（LLM-as-judge） | `evaluation/content.ts` v5.0：设计质量分析专家，多维分 + summary/improvements/**patchPlan**，支持 Focus Brief；basic/pro 双档 | `templates/evaluation_judge.md` 移植 + 自洽性检查清单；输出 `SHAPE_ANALYSIS_V2`；P1 先 generic 档 | 对齐 | pro-multi / pro-variable 档后补；judge 独立性见 §4-1 |
 | 6 | 评估→改写闭环 | `evaluation-rewrite/generic.ts`（+pro-multi / pro-variable 变体）：消费 patchPlan 定向改写 | `SHAPE_REWRITE_INFORMED`：patchPlan 注入消息 → agent 改写 → 契约校验 | 对齐 | 同上 pro 变体 |
-| 7 | 对比评估 | `evaluation-structured-compare/pair-judge.ts`（两两 LLM 评审）+ `synthesis.ts`（综合） | pair-judge 模板移植（P1）+ 确定性 compare（结构分差）作下限 + G8 信息保持检查 | 对齐＋增强 | v2 多一层确定性下限（原项目没有） |
+| 7 | 对比评估 | `evaluation-structured-compare/pair-judge.ts`（两两 LLM 评审）+ `synthesis.ts`（综合） | pair-judge 模板移植（P1）+ 确定性 compare（结构分差）作下限 | 对齐 | 确定性下限对齐原项目语义 |
 | 8 | 变量 | `variable-extraction/extraction.ts`：变化点四标准、命名规则、JSON 契约（position/occurrence/reason/category）；另有 `variable-value-generation` 与变量管理 UI | `templates/variable_extract.md` 移植 + 确定性正则抽 `{{...}}` + `SHAPE_VARIABLES` + `.prompt.yaml` 产出；批量替换脚本化 | 基本对齐 | 变量值生成模板 P2 后补；无 UI |
 | 9 | 红队 | **无独立模板**——README"红队审稿"是系统提示词优化后的*效果演示*（修正 Part I 的表述） | `templates/redteam_review.md` 显式化为独立接缝（`SHAPE_REDTEAM_REVIEW`：loopholes/risks/hidden_assumptions） | v2 增强 | 把隐式能力显式化，可单独调用 |
 | 10 | 高级测试 | 上下文变量管理（批量替换/预览）、多轮会话测试、Function Calling（OpenAI/Gemini 工具） | chat()/sessions 多轮骨架（已有）；变量批量替换脚本化；FC 不覆盖 | 部分 | FC 缺失（接缝形状可扩展，本期不做） |
@@ -22,22 +22,31 @@
 | 12 | 资产与版本 | 智能收藏 / 版本历史 / 导入导出 / Prompt Garden 提示词库 | `runs/<ts>/` 留档（raw/analysis/state/fulfil/final/report/gates）= 最小版本历史 + 断言可复现 | 部分 | 无收藏、无库、无 UI |
 | 13 | MCP / 多端 / 多模型 | Docker 自带 MCP Server（3 工具）；Web/桌面/插件/Docker 四端；12+ 供应商直连流式 | WorkBuddy 技能原生集成（零配置）；单一运行时 LLM；Lane B（stdlib HTTP 直连）默认关闭 | 不覆盖 | 形态取舍，非实现缺陷 |
 | 14 | 响应校验 | `PromptService.validateResponse`（非空等基础校验） | `contract.py` Str/Score/Json 契约 + G1–G9 门禁 | v2 增强 | 契约是超集 |
-| 15 | 质量保障 | 依赖用户在 UI 肉眼验收；无确定性门禁、无回归反例 | G1–G9 + `false_positive_demo` 回归 + 自洽 linter（A1）+ 信息保持（A4）+ 变量完整（G9）+ runs 留档 + Step7 真实用例验收 | v2 增强 | 原项目完全没有这一层 |
+| 15 | 质量保障 | 依赖用户在 UI 肉眼验收；无确定性门禁、无回归反例 | G1–G7、G9 + 自洽 linter（A1）+ 变量完整（G9）+ runs 留档 + Step7 真实用例验收 | v2 增强 | 原项目完全没有这一层（注：`false_positive_demo`/`G8 信息保持` 已于 2026-10-10 移除：前者目录从未落地、后者对抗实测无效） |
 
 ## 2. 统计
 
 - **对齐（含 2 项带增强）**：8 项 —— #1–#8（优化、多策略、双模式、迭代、评估、闭环、对比、变量）
 - **部分**：2 项 —— #10 高级测试、#12 资产（最小版）
 - **不覆盖**：2 项 —— #11 图像、#13 MCP/多端/多模型
-- **v2 独有增强**：3 项 —— #9 红队显式化、#14 契约超集、#15 质量保障层
+- **v2 独有增强**：4 项 —— #9 红队显式化、#14 契约超集、#15 质量保障层、#16 盲评分质量收敛（见 §3 第 4 条）
 
 ## 3. v2 独有增强（原项目没有的）
 
-1. **确定性门禁层**：G1–G9 每轮强制，退步当场拦截；原项目完全靠用户肉眼。
-2. **回归反例**：`false_positive_demo.txt` 进 CI 式回归，假阳性模式被永久拦住。
-3. **信息保持检查（G8）**：原文数字/引号串/专名保留率校验——原项目评估不查这个。
-4. **变量完整门禁（G9）**：把原项目 iterate 模板里的"输出前自检"升级为机器门禁。
-5. **全程留档可复现**：runs/ + state.json 使任意一轮可重放；断言不再靠记忆。
+1. **确定性门禁层**：G1–G7、G9 每轮强制，退步当场拦截；原项目完全靠用户肉眼。
+2. **变量完整门禁（G9）**：把原项目 iterate 模板里的"输出前自检"升级为机器门禁。
+3. **全程留档可复现**：runs/ + state.json 使任意一轮可重放；断言不再靠记忆。
+4. **盲评分质量收敛（2026-10-10，v2 增强 #6）**：盲评分从"只展示不控流"升级为
+   **迭代终止条件**——两层收敛 = 结构层（issues 清零 + 无 conflicts）且 质量层
+   （盲评 ≥ `--min-blind-score` 目标线 且 无单维 <60 危险线）。未达标触发有界
+   质量返工（judge weaknesses/patchPlan 回灌，`--quality-reworks` 上限默认 1，
+   plateau 无改善提前停，耗尽 → FAIL）。C3 独立性不变：judge 每轮仍只看终稿单
+   文本。默认 85 为临时值（校准 n=1：2026-10-10 简历稿终稿盲评 85），上游无此
+   机制（上游靠用户 UI 肉眼验收）——此前 G8 移除留下的"语义守护缺位"由此补上。
+
+> 2026-10-10 对抗评估后移除两项原 §3 条目：
+> - **回归反例**：文档曾称 `examples/false_positive_demo.txt` 进 CI 回归，但 `examples/` 目录从未创建，无可执行套件——属文档夸大，已纠正。
+> - **信息保持检查（G8）**：规则器对自然语言草稿类输入恒返回空（无数字/引号锚点可丢），且不校验「用户需求是否被静默丢弃」，对抗实测对语义漂移全漏，属无效护栏，故移除；语义守护交 G10 盲评（软阈值已于同日实施，见 §3 第 4 条）。
 
 ## 4. v2 仍不如原项目的（诚实清单）
 
@@ -64,7 +73,7 @@ v2 将其显式化为独立接缝属于净增强，而非移植。
 | B4 迭代空转 | **根除**（issues 回灌 + 定向融合，每轮 delta 可为正） |
 | A1 假阳性 | **显著缓解，非根除**（G7 规则层拦已知互斥模式 + judge 语义层；双层仍可能双漏） |
 | A2 词表绕过 | 缓解（双语化 + judge 不依赖词表） |
-| A4 信息丢失 | G8 拦截关键项缺失（规则近似 + judge 把关语义取舍） |
+| A4 信息丢失 | 交由 G10 盲评语义把关（建议加软阈值）；确定性层不覆盖此风险（G8 已移除） |
 | C1/C2 靠自觉 | 结构性缓解（不 resume 无 report、无 report 不许交付；彻底根治需用户配 hook） |
 | D1 真实用例 | 流程强制（Step 7 前置），执行质量仍取决于真实跑 |
 

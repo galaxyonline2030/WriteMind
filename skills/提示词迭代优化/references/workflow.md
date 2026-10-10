@@ -53,7 +53,7 @@ python run_pipeline.py --legacy "@raw.txt" "@final.md"   # 旧式一步门禁（
 | 退出码 | 含义 |
 |---|---|
 | `0` | PASS，可交付（或 --status / --report 正常结束） |
-| `1` | FAIL——issues 未清零 / 轮数耗尽 / delta 停滞 / 盲评二次冲突。**不得带病交付** |
+| `1` | FAIL——issues 未清零 / 轮数耗尽 / delta 停滞 / 盲评二次冲突 / 盲评未达质量目标（BELOW_TARGET：质量返工耗尽或 plateau 无改善）。**不得带病交付** |
 | `2` | 用法错误 |
 | `10` | 交接信号：主代理该 spawn 子代理了（fulfil 或 judge） |
 
@@ -64,7 +64,9 @@ python run_pipeline.py --legacy "@raw.txt" "@final.md"   # 旧式一步门禁（
 ## 4. 交付门禁 G1–G10
 
 G1 基线诊断 / G2 迭代管线 / G3 终稿复检 / G4 issues 清零 / G5 分数提升 /
-G6 非模板空壳 / G7 自洽 lint / G8 信息保持 / G9 变量完整 / G10 盲评 PASS。
+G6 非模板空壳 / G7 自洽 lint / G9 变量完整 / G10 盲评 PASS（含质量收敛层：
+盲评分 ≥ `--min-blind-score` 目标线 且 无单维 <60 危险线；默认 85 为临时值，
+传 0 关闭）。
 **任何一项 FAIL 都不允许交付**；`--legacy` 模式 G10 记 SKIP，不可用于正式交付。
 
 ## 5. 边界（别踩）

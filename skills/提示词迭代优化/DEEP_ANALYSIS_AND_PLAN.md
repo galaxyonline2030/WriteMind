@@ -24,13 +24,13 @@
 
 ```
 Phase A（脚本，确定性，exit 10）
-  诊断 raw → 基线分 → patchPlan（issues 逐条转改写指令）→ 路由模板
+  诊断 raw → patchPlan（issues 逐条转改写指令）→ 路由模板
   → 写 runs/<ts>/state.json {phase: AWAIT_FULFILL}
 
 --dispatch（脚本）→ 渲染自包含任务卡 dispatch/roundN.md → exit 10
 Fulfil 子代理①（独立、无会话上下文）→ 按模板改写 → 写 fulfil/roundN.txt
 
-Phase B（--resume，脚本）：fulfil 注入 realizer → 契约校验 → G7/G8/G9
+Phase B（--resume，脚本）：fulfil 注入 realizer → 契约校验 → G7/G9
   → analyze/compare → 收敛判定：
     issues 清零   → phase=AWAIT_JUDGE → exit 10
     仍有 issues   → 回灌为下一轮 patchPlan → exit 10（回到 --dispatch）
@@ -68,7 +68,7 @@ Phase B（--resume，脚本）：fulfil 注入 realizer → 契约校验 → G7/
 | `optimize_output_format.md` | output-format-optimize.ts | 格式强化策略 |
 | `user_optimize_{basic,planning,professional}.md` | user-optimize/* | 用户提示词三档 |
 | `iterate_directed.md` | iterate.ts v3.0.0 | **定向融合**语义 + 3 个 few-shot 反例 + 变量输出前自检 |
-| `evaluation_judge.md` | evaluation/content.ts v5.0 | 多维分 + strengths/weaknesses + patchPlan + 自洽性检查清单 |
+| `evaluation_judge.md` | evaluation/content.ts（develop） | 多维分（每维 **0-100**）+ 显式 **overall** + strengths/weaknesses + patchPlan + 自洽性检查清单；维度本地化（self_consistency 支撑 blocking_conflicts），分值契约与上游一致 |
 | `evaluation_rewrite.md` | evaluation-rewrite/generic.ts | 拿 patchPlan 定向改写 |
 | `redteam_review.md` | 红队审稿（净增强） | 漏洞/风险/隐含假设 |
 | `variable_extract.md` | extraction.ts | 变化点四标准 + JSON 契约 |
@@ -88,8 +88,9 @@ SHAPE_ITERATE_DIRECTED   # 定向迭代（非空 str）
 SHAPE_REDTEAM_REVIEW     # {loopholes, risks, hidden_assumptions}
 SHAPE_VARIABLES          # {variables: [...]}
 # v2.1 盲评接缝
-SHAPE_BLIND_REVIEW       # {summary, scores, strengths, weaknesses,
-                         #  patchPlan, blocking_conflicts}
+SHAPE_BLIND_REVIEW       # {summary, overall, scores(各维0-100), strengths, weaknesses,
+                         #  patchPlan, blocking_conflicts}；分值范围契约校验，
+                         # 综合分优先取 judge overall、缺失回退各维平均（对齐上游）
 ```
 
 子代理产出（fulfil 文件 / judge.json）一律经契约校验才能进入管线；
@@ -99,9 +100,9 @@ judge.json 解析宽容（容忍 ```json 围栏与前后杂散文字）。
 
 - `analyze / score / compare`：零 LLM 规则器，双语模糊词表 + 双语结构正则。
 - **G7 自洽性 lint**：互斥约束启发式（否定输出 vs 要求输出、数量冲突、元约束失效）。
-- **G8 信息保持**：抽取原文数字/量词/引号串锚点，校验终稿保留率；含
-  `_NUM_ANCHOR_EXCEPTIONS` 例外表（冠词性「一个/一名」不入锚点——E2E 实测发现的
-  A1 同类假阳性，按"修规则不绕门禁"处理）。
+- **G8 信息保持（已移除，2026-10-10 对抗评估）**：原设计抽取原文数字/量词/引号串校验保留率；
+  对抗实测证明对自然语言草稿类输入恒返回空（无锚点可丢），且不校验「用户需求是否被静默
+  丢弃」，对语义漂移全漏，属无效护栏，故移除。语义守护交 G10 盲评（建议加软阈值）。
 - **G9 变量完整性**：`{{var}}` 正则逐字校验。
 - **patchPlan 构造**：issues+suggestions 确定性转为 `{target, action}` 指令列表
   （诊断→改写回灌管道）。
@@ -123,11 +124,10 @@ judge.json 解析宽容（容忍 ```json 围栏与前后杂散文字）。
 | G4/G5 | 剩余 issues 清零 / 分数确实提升（winner=after 且 delta>0） | 禁止交付 |
 | G6 | 非通用模板产物（≠ rewrite_stub 空壳） | 禁止交付 |
 | G7 | 自洽性 lint（互斥约束） | 重派 ≤3 |
-| G8 | 关键信息保持（数字/量词/引述锚点 + 例外表） | 重派 ≤3 |
 | G9 | 变量完整性（{{var}} 逐字保留） | 重派 ≤3 |
 | G10 | 盲评已通过（独立 judge verdict=PASS）；legacy 模式记 SKIP 不阻断 | 派 judge / 返工 / FAIL |
 
-回归基线：`examples/false_positive_demo.txt` 必须持续被 G7/G6/G5 拦截（exit 1）。
+回归基线：互斥约束样例须持续被 G7 拦截（exit 1）；`examples/` 目录当前未落地，回归仅以 stubs 内联用例覆盖。
 
 ## 9. 持久化 `runs/<ts>/`
 
@@ -138,7 +138,7 @@ runs/<ts>/
   dispatch/roundN.md judge.md 子代理任务卡（留档可复现 spawn 过程）
   fulfil/roundN.txt          Fulfil 子代理产出
   fulfil/judge.json          盲评结论
-  report.json                分数轨迹 + 门禁明细 + 盲评结论 + 剩余 issues
+  report.json                门禁明细 + 盲评结论 + 剩余 issues（结构分仅内部衬底，不呈现）
 ```
 
 每次运行即一个版本，全程可复现；打包分发时清空 runs/。

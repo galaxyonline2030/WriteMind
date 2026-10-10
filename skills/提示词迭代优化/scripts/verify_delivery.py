@@ -18,10 +18,10 @@
   G4 剩余 issue 清零      analyze(final).issues 必须为空
   G5 分数确实提升         compare(raw, final) winner=after 且 delta>0
   G6 非通用模板产物       final != rewrite_stub(raw)（防止直接交付空壳模板）
-  G7 自洽性 lint          consistency_lint(final)（互斥约束，拦 false_positive_demo 类）
-  G8 关键信息保持         原文数字/量词与引述要求在终稿中不丢失
+  G7 自洽性 lint          consistency_lint(final)（互斥约束启发式，下限检查）
   G9 变量完整性           原文全部 {{var}} 必须逐字保留（对齐原项目 iterate 自检）
-  G10 盲评已通过          独立无上下文 judge 子代理的盲评结论 verdict=PASS
+  G10 盲评已通过          独立无上下文 judge 子代理的盲评结论 verdict=PASS，
+                          且（若设置质量目标）盲评分 ≥ 目标线且无 <60 低维
                           （协议模式必查：运动员不能兼裁判；legacy 记 SKIP 不阻断）
 """
 
@@ -43,7 +43,6 @@ from optimizer_adapter import (  # noqa: E402
 from stubs import (  # noqa: E402
     consistency_lint,
     extract_variables,
-    info_retention_missing,
     missing_variables,
     rewrite_stub,
 )
@@ -167,14 +166,6 @@ def run(raw: str, final: str, rounds: int = 2, mode: str = "system",
         "conflicts": lint,
     })
 
-    missing_info = info_retention_missing(raw, final)
-    checks.append({
-        "id": "G8", "name": "关键信息保持",
-        "status": OK if not missing_info else FAIL,
-        "detail": "数字/量词与引述要求完整" if not missing_info else "；".join(missing_info),
-        "missing": missing_info,
-    })
-
     missing_vars = missing_variables(raw, final)
     n_raw_vars = len(extract_variables(raw))
     # 修 2026-10-09 回归 BUG-04：原文案把「一个都没缺」写成「原文无 {{var}} 占位符」，
@@ -200,9 +191,27 @@ def run(raw: str, final: str, rounds: int = 2, mode: str = "system",
     elif protocol_history is not None:
         verdict = (blind_review or {}).get("verdict")
         if verdict == "PASS":
-            g10_status, g10_detail = OK, (
-                f"独立 judge 盲评通过（综合 "
-                f"{(blind_review or {}).get('blind_score')}，无 blocking_conflicts）")
+            # 质量收敛层复核（防裁决块与门禁脱节）：verdict=PASS 还须
+            # 盲评分 ≥ 质量目标 且 无低于危险线的维度（与 run_pipeline 对齐）。
+            qt = (blind_review or {}).get("quality_target")
+            bs = (blind_review or {}).get("blind_score")
+            low_dims = (blind_review or {}).get("low_dims") or []
+            if qt and (bs is None or bs < qt or low_dims):
+                g10_status = FAIL
+                g10_detail = (f"质量门禁未达标：盲评 {bs} < 目标 {qt}"
+                              f" 或低维 {low_dims}——G10 不允许 PASS")
+            else:
+                g10_status, g10_detail = OK, (
+                    f"独立 judge 盲评通过（综合 {bs}"
+                    + (f"≥目标 {qt}" if qt else "")
+                    + "，无 blocking_conflicts）")
+        elif verdict == "BELOW_TARGET":
+            g10_status = FAIL
+            g10_detail = (
+                f"盲评 {(blind_review or {}).get('blind_score')} 未达质量目标 "
+                f"{(blind_review or {}).get('quality_target')}"
+                f"（低维 {(blind_review or {}).get('low_dims') or '—'}）"
+                "——质量返工耗尽/无改善，不允许带病交付")
         else:
             g10_status = FAIL
             if blind_review:

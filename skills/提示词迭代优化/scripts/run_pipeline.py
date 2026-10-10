@@ -14,7 +14,7 @@ DEEP_ANALYSIS_AND_PLAN.md §1 的落地。引擎换位：agent-first——
 
 用法：
   python run_pipeline.py "@raw.txt" [system|user] [rounds] [scenario]
-      Phase A：诊断 → 基线分 → patchPlan → 写 runs/<ts>/state.json
+      Phase A：诊断 → patchPlan → 写 runs/<ts>/state.json
       退出码 10 = AWAIT_FULFILL
 
   python run_pipeline.py --dispatch runs/<ts>
@@ -26,13 +26,13 @@ DEEP_ANALYSIS_AND_PLAN.md §1 的落地。引擎换位：agent-first——
   python run_pipeline.py --resume runs/<ts>
       按 state.phase 分派：
         AWAIT_FULFILL → Phase B：读 fulfil/roundN.txt → 接缝+契约 →
-                        G7/G8/G9 → evaluate → 收敛判定
+                        G7/G9 → evaluate → 收敛判定
         AWAIT_JUDGE   → 读 fulfil/judge.json（盲评结论）→ 无冲突 →
                         G10 PASS 收尾；有冲突 → 一次有界返工回灌
       退出码：10 = 交接（fulfil / judge / 返工）；0 = PASS；1 = FAIL
 
   python run_pipeline.py --legacy "@raw.txt" "@final.md" [rounds] [mode]
-      旧式一步到位门禁（兼容 false_positive_demo 回归；G10 记 SKIP）。
+      旧式一步到位门禁（G10 记 SKIP）。
 
   python run_pipeline.py --status runs/<ts>
 
@@ -72,7 +72,6 @@ from stubs import (  # noqa: E402
     build_patch_plan,
     compare_stub,
     consistency_lint,
-    info_retention_missing,
     missing_variables,
     rewrite_stub,
     score_stub,
@@ -91,6 +90,15 @@ JUDGE_RETRIES = 2  # 盲评 judge.json 契约校验失败的重新派发上限
 SKILL_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_FULFILL = 0, 1, 2, 10
+
+# ---- 质量收敛层（v2 增强 #6：盲评分作为迭代终止条件）-----------------------
+# DEFAULT_MIN_BLIND_SCORE = 85 是【临时值 provisional】：校准数据 n=1
+#（2026-10-10 简历稿终稿盲评 85）。按「绝对阈值必须用领域内公认好样本校准」
+# 原则，正式启用前应拿 2-3 份公认好稿测 judge 分数地板，再定稳定阈值。
+# 调用方可通过 --min-blind-score 覆盖（传 0 关闭质量门禁，退回纯结构收敛）。
+DEFAULT_MIN_BLIND_SCORE = 85
+DEFAULT_QUALITY_REWORKS = 1   # 质量返工次数上限（每次配额 +1，防过拟合 judge）
+DIM_DANGER_LINE = 60          # 危险线：judge 模板语义自带「<60 的维度必须写明原因」
 
 
 def _resolve(arg: str) -> str:
@@ -191,7 +199,9 @@ def _write_report(rundir: str, state: dict, gate: str, extra: dict) -> str:
 # ---------------------------------------------------------------------------
 # Phase A：诊断 + patchPlan + state 落盘 → exit 10
 # ---------------------------------------------------------------------------
-def phase_a(raw_path: str, mode: str, rounds: int, scenario: str) -> None:
+def phase_a(raw_path: str, mode: str, rounds: int, scenario: str,
+            min_blind_score: int | None = DEFAULT_MIN_BLIND_SCORE,
+            quality_reworks: int = DEFAULT_QUALITY_REWORKS) -> None:
     raw = _resolve(raw_path)
     c = _client("phase-a")
 
@@ -202,7 +212,8 @@ def phase_a(raw_path: str, mode: str, rounds: int, scenario: str) -> None:
     a_raw = analyze(c, raw)
     for iss in a_raw["issues"]:
         print(f"          · {iss}")
-    ok(f"基线分 {a_raw['score']}/100，{len(a_raw['issues'])} 条问题")
+    ok(f"基线诊断：{len(a_raw['issues'])} 条问题"
+       f"（结构要素分仅内部衬底，不作分数呈现；质量分以盲评为准）")
 
     plan = build_patch_plan(a_raw["issues"], a_raw["suggestions"])
     ok(f"patchPlan 就绪：{len(plan)} 条改写指令（issues 回灌管道）")
@@ -249,6 +260,11 @@ def phase_a(raw_path: str, mode: str, rounds: int, scenario: str) -> None:
         "pending_plan": plan,
         "last_final": "",
         "history": [],
+        # 质量收敛层：盲评分作为迭代终止条件（两层收敛 = 结构清零 且 盲评达标）
+        "quality_target": (None if not min_blind_score else int(min_blind_score)),
+        "quality_rework_max": max(0, int(quality_reworks)),
+        "quality_rework_count": 0,
+        "conflicts_rework_done": False,
     }
     _save_state(rundir, state)
 
@@ -340,24 +356,20 @@ def phase_b(rundir: str) -> None:
     # ---- 门禁三件套（每轮都跑，退步当场拦截）--------------------------
     t = time.perf_counter()
     lint = consistency_lint(final)
-    missing_info = info_retention_missing(raw, final)
     missing_vars = missing_variables(raw, final)
-    gate_round = not (lint or missing_info or missing_vars)
+    gate_round = not (lint or missing_vars)
     if lint:
         for x in lint:
             warn(f"G7 {x}")
-    if missing_info:
-        for x in missing_info:
-            warn(f"G8 {x}")
     if missing_vars:
         warn(f"G9 缺失变量：{missing_vars}")
     if gate_round:
-        ok("G7 自洽 / G8 信息保持 / G9 变量完整 全部通过")
+        ok("G7 自洽 / G9 变量完整 全部通过")
     print(f"        （耗时 {time.perf_counter() - t:.3f}s）")
 
     if not gate_round:
         state["retries"] += 1
-        feedback = "；".join(lint + missing_info +
+        feedback = "；".join(lint +
                             [f"缺失变量 {v}" for v in missing_vars])
         state["fail_feedback"] = feedback
         _save_state(rundir, state)
@@ -394,11 +406,12 @@ def phase_b(rundir: str) -> None:
         "retries": state["retries"],
         "issues": a_fin["issues"],
         "gates": {"G7": "PASS" if not lint else "FAIL",
-                  "G8": "PASS" if not missing_info else "FAIL",
                   "G9": "PASS" if not missing_vars else "FAIL"},
     })
-    ok(f"本轮 {score_before} → {score_after}（{'+' if delta >= 0 else ''}{delta}），"
-       f"剩余 issues {len(a_fin['issues'])} 条")
+    prev_issues_n = (len(state["baseline"]["issues"]) if rnd == 1
+                     else len(state["history"][-1]["issues"]))
+    ok(f"剩余 issues {prev_issues_n} → {len(a_fin['issues'])} 条"
+       f"（收敛判定 = 清零；结构分仅内部衬底，不作分数呈现）")
 
     if a_fin["issues"]:
         for iss in a_fin["issues"]:
@@ -441,6 +454,9 @@ def phase_b(rundir: str) -> None:
         state["pending_plan"] = plan
         state["last_final"] = final
         state["phase"] = "AWAIT_FULFILL"
+        # 结构回灌 = 离开返工语境：清返工标记与质量反馈，防泄漏进后续任务卡
+        state.pop("rework_kind", None)
+        state.pop("quality_feedback", None)
         _save_state(rundir, state)
         info(f"issues 回灌为第 {rnd + 1} 轮 patchPlan（{len(plan)} 条指令）")
         print(f"\n  派发下一轮 fulfil 子代理：--dispatch {rundir}"
@@ -543,6 +559,17 @@ def _dispatch(rundir: str) -> None:
                 "修改不了就不要原样重交：同样的产出会被再次拒绝，"
                 "重派配额耗尽后整轮 FAIL。\n"
             )
+        # 质量返工卡：附上 judge 弱点判定，子代理知道本轮要补什么（C3 不受影响：
+        # judge 与改写子代理依旧互相隔离，此处只是把 judge 结论回灌给改写方——
+        # 对齐上游「评估→改写闭环」机制）。
+        qfb = state.get("quality_feedback") or ""
+        if qfb and state.get("rework_kind") == "quality":
+            feedback += (
+                "\n## 🎯 质量返工背景（盲评未达标）——本轮补强目标\n\n"
+                f"```text\n{qfb}\n```\n\n"
+                "以上是独立 judge 对上一版终稿的弱点判定，必须逐条针对性改进；"
+                "同时保持全部 {{var}} 占位符与已达标的结构不变。\n"
+            )
         card = FULFIL_CARD.format(
             rnd=rnd,
             kind="informed 改写" if rnd == 1 else "iterate_directed 定向迭代",
@@ -557,14 +584,20 @@ def _dispatch(rundir: str) -> None:
         msgs = render_judge_messages(state["last_final"] or state["raw"])
         template = msgs[0]["content"]  # system 消息 = evaluation_judge 模板正文
         out_path = os.path.join(rundir, "fulfil", "judge.json")
+        # 修 2026-10-09 回归 BUG-07（BUG-03 在 judge 路径的复发变体）：
+        # judge 契约失败写在 state["judge_feedback"]，此处却读 fulfil 路径的
+        # fail_feedback（fb）→ 条件永假，重派卡与首派逐字相同，judge 会重犯
+        # 同样的契约错误直至配额耗尽。改为读 judge_feedback。
         feedback = ""
-        if fb and state.get("judge_retries", 0) > 0:
+        jfb = state.get("judge_feedback") or ""
+        if jfb and state.get("judge_retries", 0) > 0:
             feedback = (
                 "\n## ⚠ 上一版 judge.json 被契约校验拒绝（第 "
                 f"{state['judge_retries']}/{JUDGE_RETRIES} 次重派）——必须修掉\n\n"
-                f"```text\n{fb}\n```\n\n"
+                f"```text\n{jfb}\n```\n\n"
                 "常见原因：字符串值里出现非法转义（如反引号前加反斜杠）、JSON 外"
-                "包裹了说明文字。文件首字符必须是 `{`，且不要写任何反斜杠。\n"
+                "包裹了说明文字、分值超出 0-100 契约范围。文件首字符必须是 `{`，"
+                "且不要写任何反斜杠。\n"
             )
         card = JUDGE_CARD.format(
             template=template,
@@ -634,6 +667,25 @@ def _normalize_plan(items: list) -> list:
     return plan
 
 
+def _blind_score(review: dict) -> tuple:
+    """综合盲评分：(score, source)。
+
+    对齐上游 evaluation/content.ts 的 overall 语义：模型的整体质量判断
+    **优先于**各维算术平均——上游把 overall 留给 judge 综合裁定，而不是
+    代码求均值；仅当 judge 未给出 overall（旧版 judge.json）时回退均值。
+    """
+    overall = review.get("overall")
+    if isinstance(overall, (int, float)) and not isinstance(overall, bool):
+        return round(float(overall), 1), "overall"
+    scores = review.get("scores")
+    if isinstance(scores, dict) and scores:
+        vals = [float(v) for v in scores.values()
+                if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        if vals:
+            return round(sum(vals) / len(vals), 1), "mean_fallback"
+    return None, None
+
+
 def phase_judge(rundir: str) -> None:
     state = _load_state(rundir)
     if state["phase"] != "AWAIT_JUDGE":
@@ -686,22 +738,28 @@ def phase_judge(rundir: str) -> None:
         archive = None
 
     scores = review["scores"]
-    blind_score = None
+    blind_score, blind_src = _blind_score(review)
+    # 刻度疑似误用告警：范围契约拦得住 >100 的越界，拦不住 0-10 刻度
+    #（其值全部落在 0-100 内）。全维 ≤10 时提示人工核对（模板已显式要求 0-100）。
     if isinstance(scores, dict) and scores:
-        vals = [float(v) for v in scores.values()
-                if isinstance(v, (int, float))]
-        if vals:
-            blind_score = round(sum(vals) / len(vals), 1)
+        _vals = [float(v) for v in scores.values()
+                 if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        if _vals and max(_vals) <= 10:
+            warn("盲评各维全部 ≤10，疑似误用 0-10 刻度（契约要求 0-100，"
+                 "对齐上游 content.ts）——请人工核对 judge.json")
     conflicts = review["blocking_conflicts"]
     state["blind_review"] = {
         "judge_file": os.path.relpath(judge_path, rundir),
         "summary": review["summary"],
         "scores": scores,
+        "overall": review.get("overall"),
         "blind_score": blind_score,
+        "blind_score_source": blind_src,
         "strengths": review["strengths"],
         "weaknesses": review["weaknesses"],
         "patch_plan": review["patchPlan"],
         "blocking_conflicts": conflicts,
+        "quality_target": state.get("quality_target"),
         "dispatch_card": state.get("dispatch_card"),
         "fulfil_latency_sec": latency,
         "archive": os.path.relpath(archive, rundir) if archive else None,
@@ -709,11 +767,13 @@ def phase_judge(rundir: str) -> None:
     }
     state.setdefault("blind_reviews", []).append(dict(state["blind_review"]))
 
-    ok(f"盲评接收：综合 {blind_score}，strengths {len(review['strengths'])} 条 / "
+    ok(f"盲评接收：综合 {blind_score}"
+       f"（{'judge overall' if blind_src == 'overall' else '各维平均回退'}），"
+       f"strengths {len(review['strengths'])} 条 / "
        f"weaknesses {len(review['weaknesses'])} 条 / "
        f"blocking_conflicts {len(conflicts) if isinstance(conflicts, list) else '?'} 条")
 
-    if conflicts and state.get("rework_done"):
+    if conflicts and state.get("conflicts_rework_done"):
         # 二次冲突：有界返工已用尽，诚实失败（不允许带病交付）。
         state["blind_review"]["verdict"] = "REWORK_EXHAUSTED"
         _save_state(rundir, state)
@@ -725,7 +785,9 @@ def phase_judge(rundir: str) -> None:
     if conflicts:
         # 一次有界返工：冲突 + judge patchPlan 回灌，扩一轮配额。
         plan = _normalize_plan(conflicts) + _normalize_plan(review["patchPlan"])
-        state["rework_done"] = True
+        state["conflicts_rework_done"] = True
+        state["rework_kind"] = "conflicts"
+        state.pop("quality_feedback", None)  # 防残留泄漏进 conflicts 返工卡
         state["pending_plan"] = plan
         state["round"] = state["round"] + 1
         state["max_rounds"] = state["max_rounds"] + 1
@@ -739,10 +801,72 @@ def phase_judge(rundir: str) -> None:
         print("  返工后收敛将再次进入盲评；二次冲突即 FAIL。")
         raise SystemExit(EXIT_FULFILL)
 
-    # 无冲突：G10 PASS，进入终态。
+    # ---- 质量收敛层（v2 增强 #6）：盲评分作为迭代终止条件 -------------------
+    # 两层收敛 = 结构层（无 conflicts / issues 清零）且 质量层（盲评达标）。
+    # 达标判定双保险：overall ≥ 目标线 且 各维 ≥ 危险线 DIM_DANGER_LINE。
+    target = state.get("quality_target")
+    if target:
+        low_dims = [k for k, v in (scores.items() if isinstance(scores, dict) else [])
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)
+                    and v < DIM_DANGER_LINE]
+        state["blind_review"]["low_dims"] = low_dims
+        if blind_score is None or blind_score < target or low_dims:
+            # 本次盲评已被 append 进 blind_reviews，[:-1] = 历史最优（不含本次）
+            prev_reviews = state.get("blind_reviews", [])[:-1]
+            prev_best = max((b.get("blind_score") or -1) for b in prev_reviews) \
+                if prev_reviews else None
+            count = state.get("quality_rework_count", 0)
+            exhausted = count >= state.get("quality_rework_max",
+                                           DEFAULT_QUALITY_REWORKS)
+            no_gain = (prev_best is not None and count > 0
+                       and (blind_score or 0) <= prev_best)
+            if exhausted or no_gain:
+                # 耗尽语义 = FAIL（与 conflicts 二次冲突对称，不允许带病交付）。
+                reason = ("质量返工次数耗尽" if exhausted else
+                          f"返工后盲评 {blind_score} 未超过历史最优 {prev_best}"
+                          "（plateau 护栏：防噪声空转）")
+                state["blind_review"]["verdict"] = "BELOW_TARGET"
+                _save_state(rundir, state)
+                warn(f"盲评 {blind_score} 未达质量目标 {target}"
+                     f"（低维 {low_dims or '—'}）→ {reason} → FAIL（不允许带病交付）")
+                if prev_best is not None and prev_best > 0:
+                    print(f"  ⓘ 历史最优盲评 {prev_best} 分的产物已留档于 fulfil/，"
+                          "报告「盲评质量分轨迹」标注了最优轮次，可人工取用。")
+                _finish(rundir, state, state["raw"], state["mode"], "FAIL",
+                        time.perf_counter(),
+                        {"abort": "quality_below_target", "quality_target": target,
+                         "blind_score": blind_score, "low_dims": low_dims,
+                         "best_blind_score": prev_best})
+                return
+            # 有界质量返工：judge weaknesses + patchPlan 回灌，扩一轮配额。
+            plan = _normalize_plan(review["patchPlan"])
+            for d in low_dims:
+                plan.insert(0, {"target": f"维度 {d} 低于危险线 {DIM_DANGER_LINE}",
+                                "action": f"补强盲评维度「{d}」：对照 judge weaknesses"
+                                          "逐条落实，保持其余结构与全部 {{var}} 不变"})
+            state["quality_rework_count"] = count + 1
+            state["quality_feedback"] = "；".join(review.get("weaknesses") or [])
+            state["rework_kind"] = "quality"
+            state["pending_plan"] = plan
+            state["round"] = state["round"] + 1
+            state["max_rounds"] = state["max_rounds"] + 1
+            state["retries"] = 0
+            state["phase"] = "AWAIT_FULFILL"
+            _save_state(rundir, state)
+            warn(f"盲评 {blind_score} 未达质量目标 {target} → 质量返工"
+                 f"（第 {state['quality_rework_count']}/"
+                 f"{state['quality_rework_max']} 次，配额 +1）")
+            print(f"\n  派发质量返工 fulfil 子代理：--dispatch {rundir}"
+                  f"  → dispatch/round{state['round']}.md")
+            print("  返工后重走结构门禁并再次盲评；分数耗尽未达标或无改善即 FAIL。")
+            raise SystemExit(EXIT_FULFILL)
+
+    # 无冲突且质量达标：G10 PASS，进入终态。
     state["blind_review"]["verdict"] = "PASS"
     _save_state(rundir, state)
-    ok("盲评无 blocking_conflicts → G10 盲评独立性 PASS")
+    _q = (f"，质量 {blind_score}≥{target}"
+          if target else "")
+    ok(f"盲评无 blocking_conflicts{_q} → G10 盲评 PASS")
     _finish(rundir, state, state["raw"], state["mode"], "PASS",
             time.perf_counter())
 
@@ -766,8 +890,12 @@ def _finish(rundir: str, state: dict, raw: str, mode: str,
     gate = res["gate"]
     path = _write_report(rundir, state, gate, {"delivery_gate": res, **(extra or {})})
     hdr("结论")
-    print(f"  {res['score_before']} → {res['score_final']}  "
-          f"(delta={res['delta']})    门禁：{gate}")
+    _brs = state.get("blind_reviews") or \
+        ([state["blind_review"]] if state.get("blind_review") else [])
+    _bq = next((b.get("blind_score") for b in reversed(_brs)
+                if b.get("blind_score") is not None), None)
+    print(f"  盲评质量分：{_bq if _bq is not None else '—'}（LLM-as-judge · 0-100）"
+          f"    剩余问题：{len(res.get('remaining_issues') or [])} 条    门禁：{gate}")
     print(f"  报告：{path}")
     print(f"  全流程耗时 {time.perf_counter() - t:.2f}s\n")
     raise SystemExit(EXIT_OK if gate == "PASS" else EXIT_FAIL)
@@ -781,8 +909,8 @@ def _legacy(args: list) -> None:
     rounds = int(args[2]) if len(args) > 2 else 2
     mode = args[3] if len(args) > 3 else "system"
     res = verify_run(raw, final, rounds, mode)
-    print(f"\n交付门禁：{res['gate']}   （{res['score_before']} → {res['score_final']}，"
-          f"delta={res['delta']}）")
+    print(f"\n交付门禁：{res['gate']}"
+          f"（质量分以盲评为准，结构分仅内部衬底；失败项见下方逐项）")
     for c_ in res["checks"]:
         mark = "✓" if c_["status"] == "PASS" else ("○" if c_["status"] == "SKIP"
                                                    else "✗")
@@ -799,15 +927,36 @@ def _status(rundir: str) -> None:
     for h in s["history"]:
         print(f"    r{h['round']}: {h['score_before']} → {h['score_after']} "
               f"(delta={h['delta']})  剩余 issues {len(h['issues'])}")
+    qt = s.get("quality_target")
+    print(f"  质量门禁：target={qt if qt else '关闭'}"
+          f"  质量返工 {s.get('quality_rework_count', 0)}"
+          f"/{s.get('quality_rework_max', DEFAULT_QUALITY_REWORKS)}")
     br = s.get("blind_review")
     if br:
         print(f"  盲评：verdict={br.get('verdict')}  综合={br.get('blind_score')}"
-              f"  conflicts={len(br.get('blocking_conflicts') or [])}")
+              f"  conflicts={len(br.get('blocking_conflicts') or [])}"
+              f"  低维={br.get('low_dims') or '—'}")
     raise SystemExit(EXIT_OK)
 
 
 def main() -> None:
     args = sys.argv[1:]
+    # 剥离可选 flag：--min-blind-score N（盲评质量目标，0=关闭）、
+    # --quality-reworks N（质量返工次数上限）。剩余按位置参数处理。
+    min_blind_score, quality_reworks = DEFAULT_MIN_BLIND_SCORE, DEFAULT_QUALITY_REWORKS
+    flags = {}
+    i = 0
+    while i < len(args):
+        if args[i] == "--min-blind-score" and i + 1 < len(args):
+            flags["min_blind_score"] = int(args[i + 1])
+            del args[i:i + 2]
+        elif args[i] == "--quality-reworks" and i + 1 < len(args):
+            flags["quality_reworks"] = int(args[i + 1])
+            del args[i:i + 2]
+        else:
+            i += 1
+    min_blind_score = flags.get("min_blind_score", min_blind_score)
+    quality_reworks = flags.get("quality_reworks", quality_reworks)
     if args and args[0] == "--resume":
         if len(args) < 2:
             print(__doc__)
@@ -846,7 +995,8 @@ def main() -> None:
         mode = args[1] if len(args) > 1 else "system"
         rounds = int(args[2]) if len(args) > 2 else 2
         scenario = args[3] if len(args) > 3 else "general"
-        phase_a(raw_path, mode, rounds, scenario)
+        phase_a(raw_path, mode, rounds, scenario,
+                min_blind_score=min_blind_score, quality_reworks=quality_reworks)
     else:
         print(__doc__)
         raise SystemExit(EXIT_USAGE)
