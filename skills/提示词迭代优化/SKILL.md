@@ -4,7 +4,7 @@ description: "把薄弱、口语化或结构不清的提示词改写为结构化
 agent_created: true
 ---
 
-# 提示词迭代优化 v2.2（agent-first + 结构性子代理 + 可视化报告）
+# 提示词迭代优化 v2.3（agent-first + 结构性子代理 + 可视化报告）
 
 > **⚠ 用前必读：[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)**——全部已知问题、假阳性反例、
 > 修复状态与元教训。规则引擎只当下限；本技能的正确用法是：规则引擎当下限 →
@@ -41,14 +41,17 @@ v2.1 引擎换位：**确定性引擎只做前处理（诊断+patchPlan）与后
 6. **两层收敛（v2 增强 #6，2026-10-10）**：结构层（issues 清零 + 无 blocking_conflicts）
    **且** 质量层（盲评分 ≥ `--min-blind-score` 目标线 且 无单维 < 60 危险线）。
    未达标 → judge weaknesses/patchPlan 回灌为**质量返工**（受 `--quality-reworks`
-   上限保护，返工后无改善即 plateau 提前停）；耗尽仍未达标 → **FAIL**（与二次冲突
-   对称，不允许带病交付）。阈值默认 85 为**临时值**（校准 n=1），传 0 关闭质量门禁。
+   上限保护，默认 2 次，返工后无改善即 plateau 提前停）；耗尽仍未达标 → **FAIL**
+   （与二次冲突对称，不允许带病交付）。阈值默认 85 为**临时值**（校准 n=1），传 0 关闭质量门禁。
+   **Plan A 选优（v2.3）**：任何终态（PASS / FAIL / 达迭代上限）均自动交付「盲评分最高且无
+   blocking_conflicts」的那一轮，而非最后一轮；`last_final` 原样留档，选优轮写入 `delivered_final`
+   并展示于 `report.html`。无合格盲评记录时退回最后一轮。
 6. `scripts/` 内绝不 import / 调用任何 LLM SDK。
 
 ## 3. 工作流（三段式乒乓协议 + 强制盲评）
 
 1. **收口需求**：确认 mode（system | user）、场景（general | analytical | format |
-   basic | planning | professional）、轮数上限（默认 2）。用户不答用默认值并在报告中标注。
+   basic | planning | professional）、轮数上限（结构循环 `max_rounds`，默认 2）。另有**全局最大迭代次数 `max_iterations`**（默认 5，可 `--max-iterations` 指定），结构循环与所有返工合计计入此上限，达上限即强制终止并交付历史最优轮。用户不答用默认值并在报告中标注。
 
    **轮数上限怎么定**（`max_rounds`，命令行第 3 个位置参数，默认 2）：
 
@@ -61,10 +64,13 @@ v2.1 引擎换位：**确定性引擎只做前处理（诊断+patchPlan）与后
 
    设大 ≠ 跑满：迭代在 issues 清零时立刻停止，上限只是天花板。设太大的代价是
    每轮多烧一次子代理调用，且 `plateau`（连续 2 轮 delta < 5）会提前判 FAIL。
-   真不够用时三条路：盲评返工**自动 +1**；手工改 `state.json` 的 `max_rounds`
+   真不够用时三条路：冲突返工**自动 +1**（计入全局 `max_iterations`）；手工改 `state.json` 的 `max_rounds`
    （同时把 `round` 改成下一轮、`phase` 改 `AWAIT_FULFILL`——注意是
    **`AWAIT_FULFILL` 两个 L**）；或重新起一个 run。
    当前进度随时用 `--status` 看：`round=X/Y`。
+   **全局最大迭代次数 `max_iterations`（默认 5，可 `--max-iterations N` 指定）**：
+   是结构循环 + 所有返工的**合计硬天花板**。冲突返工、质量返工都会让 `max_rounds` 自增，
+   真正约束"总轮数不爆"的是 `max_iterations`；达上限立即终止并交付历史最优轮（Plan A 选优）。
 2. **Phase A（脚本）**：`cd scripts && python run_pipeline.py "@raw.txt" system 2 general`
    → 诊断、patchPlan、路由模板 → 写 `runs/<ts>/state.json` → **exit 10**。
 3. **派发 fulfil 子代理（结构性触点①）**：
@@ -84,13 +90,13 @@ v2.1 引擎换位：**确定性引擎只做前处理（诊断+patchPlan）与后
    - `blocking_conflicts` 为空且盲评达标（≥ 目标线且无 <60 低维）→ G10 PASS →
      全量 G1–G10 门禁 → **exit 0**（可交付）
    - 有冲突且未返工过 → 冲突 + judge patchPlan 回灌，配额 +1，**exit 10**（回到第 3 步）
-   - 返工后二次冲突 → **exit 1**（不允许带病交付）
+   - 返工后二次冲突 → **exit 1**（不允许带病交付；仍按 Plan A 选优交付历史最优轮）
    - 无冲突但盲评未达标 → **质量返工**：weaknesses/patchPlan 回灌（返工卡附
      judge 弱点背景），配额 +1，**exit 10**（回到第 3 步）；返工次数耗尽或
-     分数无改善（plateau）→ **exit 1**（verdict=BELOW_TARGET，报告标注历史最优轮）
+     分数无改善（plateau）或达全局 `max_iterations` → **exit 1**（verdict=BELOW_TARGET，仍按 Plan A 选优交付历史最优轮）
 6. **重派**：接缝契约或门禁失败 → 脚本附反馈 exit 10，主代理把它并入重新渲染的
    任务卡再派子代理；每轮上限 3 次，耗尽 exit 1。
-7. **交付**：终稿 + report.json 摘要（剩余 issues、门禁明细、盲评结论）。
+7. **交付（Plan A 选优）**：交付「盲评分最高且无 blocking_conflicts」的那一轮终稿（非末轮）+ report.json 摘要（剩余 issues、门禁明细、盲评结论、实际交付轮次 `delivery_selected_round`）。
 8. **真实用例验收（强制）**：宣告完成前，必须拿 ≥1 个真实输入跑一遍终稿，把输出留档
    到 run 目录并向用户展示。脚本层只能提醒，无法代劳——这是最后的质量关口。
 9. **生成可视化报告（v2.2 起）**：`python run_pipeline.py --report runs/<ts>`
@@ -106,7 +112,8 @@ cd scripts
 # 三段式协议（主路径；子代理触点①②均为 --dispatch + Agent 工具 spawn）
 python run_pipeline.py "@raw.txt" system 2 general   # Phase A → exit 10
 # 可选 flag：--min-blind-score N（质量目标，默认 85 临时值，0=关闭）
-#            --quality-reworks N（质量返工上限，默认 1）
+#            --quality-reworks N（质量返工上限，默认 2）
+#            --max-iterations N（全局最大迭代次数，默认 5；结构循环+返工合计计入）
 python run_pipeline.py "@raw.txt" user 3 professional --min-blind-score 85
 python run_pipeline.py --dispatch runs/<ts>          # 渲染子代理任务卡 → exit 10
 python run_pipeline.py --resume runs/<ts>            # Phase B / 盲评裁决 → 0 / 10 / 1
@@ -200,7 +207,7 @@ prompt-optimizer/
 - 契约校验 / G7-G9 失败 → 附反馈重新派发 fulfil 子代理覆盖同一文件，每轮 ≤3 次，耗尽 exit 1。
 - judge.json 契约失败 → 重新派发 judge 子代理，≤2 次；盲评二次冲突 → exit 1。
 - 子代理偏离模板 → 回派并附"只输出终稿本身"约束，≤3 次。
-- issues 停滞或轮数耗尽 → exit 1 并明示剩余问题；禁止"看着差不多"就交付。
+- issues 停滞或轮数耗尽（含达全局 `max_iterations`）→ exit 1 并明示剩余问题；禁止"看着差不多"就交付；仍按 Plan A 选优交付历史最优轮。
 - 诚实边界：G7 拦已知互斥模式；语义级矛盾由盲评 judge 兜底，双层仍可能双漏
   （KNOWN_ISSUES C4）；真实用例验收（第 3 节第 8 步）是最终关口。
 

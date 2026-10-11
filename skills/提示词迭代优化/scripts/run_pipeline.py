@@ -13,9 +13,15 @@ DEEP_ANALYSIS_AND_PLAN.md §1 的落地。引擎换位：agent-first——
      没有盲评结论就不允许 PASS 交付）。
 
 用法：
-  python run_pipeline.py "@raw.txt" [system|user] [rounds] [scenario]
+  python run_pipeline.py "@raw.txt" [system|user] [rounds] [scenario] \
+      [--min-blind-score N] [--quality-reworks N] [--max-iterations N]
       Phase A：诊断 → patchPlan → 写 runs/<ts>/state.json
       退出码 10 = AWAIT_FULFILL
+
+  可选 flag：
+    --min-blind-score N   盲评质量目标（0=关闭质量门禁），默认 85（未校准临时值）
+    --quality-reworks N   质量返工次数上限，默认 2
+    --max-iterations  N   全局最大改写轮次硬上限（结构循环+返工合计），默认 5
 
   python run_pipeline.py --dispatch runs/<ts>
       按 state.phase 渲染子代理任务卡：
@@ -97,8 +103,9 @@ EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_FULFILL = 0, 1, 2, 10
 # 原则，正式启用前应拿 2-3 份公认好稿测 judge 分数地板，再定稳定阈值。
 # 调用方可通过 --min-blind-score 覆盖（传 0 关闭质量门禁，退回纯结构收敛）。
 DEFAULT_MIN_BLIND_SCORE = 85
-DEFAULT_QUALITY_REWORKS = 1   # 质量返工次数上限（每次配额 +1，防过拟合 judge）
+DEFAULT_QUALITY_REWORKS = 2   # 质量返工次数上限（默认 2，与 max_rounds=2 对齐；每次配额 +1，防过拟合 judge 噪声）
 DIM_DANGER_LINE = 60          # 危险线：judge 模板语义自带「<60 的维度必须写明原因」
+DEFAULT_MAX_ITERATIONS = 5    # 全局最大迭代（改写）轮次硬上限：结构循环 + 返工 合计不超过此数；可用 --max-iterations 覆盖
 
 
 def _resolve(arg: str) -> str:
@@ -185,7 +192,7 @@ def _write_report(rundir: str, state: dict, gate: str, extra: dict) -> str:
         "score_before": state["baseline"]["score"],
         "score_final": state["history"][-1]["score_after"] if state["history"] else None,
         "remaining_issues": state["history"][-1]["issues"] if state["history"] else [],
-        "final": state.get("last_final", ""),
+        "final": state.get("delivered_final") or state.get("last_final", ""),
         "template": state["template"],
         "history": state["history"],
         **extra,
@@ -201,7 +208,8 @@ def _write_report(rundir: str, state: dict, gate: str, extra: dict) -> str:
 # ---------------------------------------------------------------------------
 def phase_a(raw_path: str, mode: str, rounds: int, scenario: str,
             min_blind_score: int | None = DEFAULT_MIN_BLIND_SCORE,
-            quality_reworks: int = DEFAULT_QUALITY_REWORKS) -> None:
+            quality_reworks: int = DEFAULT_QUALITY_REWORKS,
+            max_iterations: int = DEFAULT_MAX_ITERATIONS) -> None:
     raw = _resolve(raw_path)
     c = _client("phase-a")
 
@@ -250,6 +258,7 @@ def phase_a(raw_path: str, mode: str, rounds: int, scenario: str,
         "raw_path": raw_path,
         "mode": mode,
         "max_rounds": rounds,
+        "max_iterations": max(1, int(max_iterations)),
         "scenario": scenario,
         "template": template,
         "round": 1,
@@ -421,7 +430,8 @@ def phase_b(rundir: str) -> None:
     plateau = (len(state["history"]) >= 2
                and state["history"][-1]["delta"] < EPS
                and state["history"][-2]["delta"] < EPS)
-    out_of_rounds = rnd >= state["max_rounds"]
+    out_of_rounds = (rnd >= state["max_rounds"]
+                     or rnd >= state.get("max_iterations", DEFAULT_MAX_ITERATIONS))
 
     if converged:
         # 收敛 ≠ 可交付：强制盲评轮（C3 独立性 / G10 门禁）。
@@ -789,6 +799,10 @@ def phase_judge(rundir: str) -> None:
         state["rework_kind"] = "conflicts"
         state.pop("quality_feedback", None)  # 防残留泄漏进 conflicts 返工卡
         state["pending_plan"] = plan
+        # 全局最大迭代次数硬上限：再开一轮会越界则直接交付历史最优轮并终止
+        if state["round"] >= state.get("max_iterations", DEFAULT_MAX_ITERATIONS):
+            _finalize_by_cap(rundir, state)
+            return
         state["round"] = state["round"] + 1
         state["max_rounds"] = state["max_rounds"] + 1
         state["retries"] = 0
@@ -848,6 +862,10 @@ def phase_judge(rundir: str) -> None:
             state["quality_feedback"] = "；".join(review.get("weaknesses") or [])
             state["rework_kind"] = "quality"
             state["pending_plan"] = plan
+            # 全局最大迭代次数硬上限：再开一轮会越界则直接交付历史最优轮并终止
+            if state["round"] >= state.get("max_iterations", DEFAULT_MAX_ITERATIONS):
+                _finalize_by_cap(rundir, state)
+                return
             state["round"] = state["round"] + 1
             state["max_rounds"] = state["max_rounds"] + 1
             state["retries"] = 0
@@ -871,6 +889,60 @@ def phase_judge(rundir: str) -> None:
             time.perf_counter())
 
 
+def _select_best_delivery(rundir: str, state: dict) -> str:
+    """Plan A：交付「盲评分最高且无 blocking_conflicts」的那一轮 fulfil 文本。
+
+    找不到合格盲评记录时退回 state["last_final"]（最后一轮产出），
+    保证任何终态都有可交付文本。选中的轮次与文本同时写入 state，供报告标注。
+    """
+    best_text, best_score, best_round = None, -1, None
+    for rev in state.get("blind_reviews", []):
+        if rev.get("blocking_conflicts"):
+            continue  # 有互斥/失效约束的轮次绝不交付
+        sc = rev.get("blind_score")
+        if sc is None or sc <= best_score:
+            continue
+        rnd = rev.get("round")
+        fp = os.path.join(rundir, "fulfil", f"round{rnd}.txt")
+        if not os.path.exists(fp):
+            continue
+        try:
+            with open(fp, encoding="utf-8") as f:
+                txt = f.read()
+        except OSError:
+            continue
+        best_text, best_score, best_round = txt, sc, rnd
+    delivered = best_text if best_text is not None else state.get("last_final", "")
+    state["delivered_final"] = delivered
+    state["delivery_selected_round"] = best_round
+    return delivered
+
+
+def _finalize_by_cap(rundir: str, state: dict) -> None:
+    """达到全局最大迭代次数：强制终止，交付历史最优轮（Plan A）。"""
+    _select_best_delivery(rundir, state)
+    _save_state(rundir, state)
+    cap = state.get("max_iterations", DEFAULT_MAX_ITERATIONS)
+    sel = state.get("delivery_selected_round")
+    sel_score = None
+    if sel is not None:
+        for rev in state.get("blind_reviews", []):
+            if rev.get("round") == sel:
+                sel_score = rev.get("blind_score")
+                break
+    if sel is not None:
+        warn(f"达到最大迭代次数 {cap}，强制终止 → 交付历史最优轮"
+             f"（轮次 r{sel}，盲评 {sel_score} 分）")
+    else:
+        warn(f"达到最大迭代次数 {cap}，强制终止 → 无合格盲评记录，退回最后一轮")
+    blind_expected = bool(state.get("blind_reviews"))
+    _finish(rundir, state, state["raw"], state["mode"], "FAIL",
+            time.perf_counter(),
+            {"stop_reason": f"达到最大迭代次数 {cap}",
+             "delivery_selected_round": sel},
+            blind_expected=blind_expected)
+
+
 def _finish(rundir: str, state: dict, raw: str, mode: str,
             expect: str, t: float, extra: dict | None = None,
             blind_expected: bool = True) -> None:
@@ -880,7 +952,10 @@ def _finish(rundir: str, state: dict, raw: str, mode: str,
     G4 并列造成归因噪音（修 2026-10-09 回归 BUG-05）。
     """
     blind = state.get("blind_review")
-    res = verify_run(raw, state["last_final"], state["max_rounds"], mode,
+    # Plan A：交付盲评分最高且无硬冲突的那一轮（_select_best_delivery 会写
+    # state["delivered_final"] / ["delivery_selected_round"]，last_final 原样保留归档）。
+    delivered = _select_best_delivery(rundir, state)
+    res = verify_run(raw, delivered, state["max_rounds"], mode,
                      protocol_history=state["history"], blind_review=blind,
                      blind_expected=blind_expected)
     for ch in res["checks"]:
@@ -896,6 +971,10 @@ def _finish(rundir: str, state: dict, raw: str, mode: str,
                 if b.get("blind_score") is not None), None)
     print(f"  盲评质量分：{_bq if _bq is not None else '—'}（LLM-as-judge · 0-100）"
           f"    剩余问题：{len(res.get('remaining_issues') or [])} 条    门禁：{gate}")
+    _sel = state.get("delivery_selected_round")
+    if _sel is not None:
+        print(f"  ⓘ 实际交付轮次：r{_sel}（Plan A 选优：盲评分最高且无硬冲突；"
+              f"最后一轮 r{state['round']} 仅作归档）")
     print(f"  报告：{path}")
     print(f"  全流程耗时 {time.perf_counter() - t:.2f}s\n")
     raise SystemExit(EXIT_OK if gate == "PASS" else EXIT_FAIL)
@@ -944,6 +1023,7 @@ def main() -> None:
     # 剥离可选 flag：--min-blind-score N（盲评质量目标，0=关闭）、
     # --quality-reworks N（质量返工次数上限）。剩余按位置参数处理。
     min_blind_score, quality_reworks = DEFAULT_MIN_BLIND_SCORE, DEFAULT_QUALITY_REWORKS
+    max_iterations = DEFAULT_MAX_ITERATIONS
     flags = {}
     i = 0
     while i < len(args):
@@ -952,6 +1032,9 @@ def main() -> None:
             del args[i:i + 2]
         elif args[i] == "--quality-reworks" and i + 1 < len(args):
             flags["quality_reworks"] = int(args[i + 1])
+            del args[i:i + 2]
+        elif args[i] == "--max-iterations" and i + 1 < len(args):
+            max_iterations = int(args[i + 1])
             del args[i:i + 2]
         else:
             i += 1
@@ -996,7 +1079,8 @@ def main() -> None:
         rounds = int(args[2]) if len(args) > 2 else 2
         scenario = args[3] if len(args) > 3 else "general"
         phase_a(raw_path, mode, rounds, scenario,
-                min_blind_score=min_blind_score, quality_reworks=quality_reworks)
+                min_blind_score=min_blind_score, quality_reworks=quality_reworks,
+                max_iterations=max_iterations)
     else:
         print(__doc__)
         raise SystemExit(EXIT_USAGE)

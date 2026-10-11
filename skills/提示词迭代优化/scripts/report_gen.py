@@ -391,7 +391,9 @@ def build(rundir: str, out_path: str | None = None) -> str:
             + '</div>')
 
     raw_txt = _t(os.path.join(rundir, "raw.md")) or state.get("raw", "")
-    final_txt = state.get("last_final", "") or (hist[-1]["output"] if hist else "")
+    final_txt = (state.get("delivered_final")
+                 or state.get("last_final", "")
+                 or (hist[-1]["output"] if hist else ""))
 
     html_doc = f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
