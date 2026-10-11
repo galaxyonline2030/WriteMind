@@ -1,6 +1,10 @@
 ---
-name: 提示词迭代优化
-description: "把薄弱、口语化或结构不清的提示词改写为结构化、可落地的高质量提示词（默认 LangGPT 风格）。触发词：优化提示词、改写 prompt、把提示词写得更结构化、提示词效果不好、提示词工程、结构化提示词、LangGPT、rewrite prompt、make my prompt better、improve this system prompt。v2.1 agent-first 三段式文件协议：确定性引擎做前处理与 G1-G10 门禁，改写/迭代由独立 fulfil 子代理经 dispatch 任务卡执行，收敛后强制盲评轮（无上下文 judge 子代理，G10），主代理只做文件编排。不依赖任何外部 LLM SDK client（对齐 llm-client-sim 虚拟客户端范式）。能力边界：规则器只保证结构下限与流程留痕，语义质量由模板×子代理兑现，最终以真实用例验收。"
+name: prompt-iteration-optimizer
+version: "2.3.0"
+display_name: 提示词迭代优化
+display_name_en: Prompt Iteration Optimizer
+description_zh: "把薄弱、口语化或结构不清的提示词改写为结构化、可落地的高质量提示词（默认 LangGPT 风格）。采用 agent-first 三段式文件协议：确定性引擎做前处理与 G1-G10 门禁，改写与迭代由独立 fulfil 子代理经 dispatch 任务卡执行，收敛后强制无上下文盲评轮（G10），主代理只做文件编排。不依赖外部 LLM SDK client，语义质量由模板与子代理兑现，最终以真实用例验收。触发词：优化提示词、改写 prompt、把提示词写得更结构化、提示词效果不好、提示词工程、结构化提示词、LangGPT、rewrite prompt、make my prompt better、improve this system prompt。"
+description_en: "Rewrite weak, colloquial, or loosely-structured prompts into structured, actionable, high-quality prompts (LangGPT style by default). Uses an agent-first three-stage file protocol: a deterministic engine handles pre-processing and the G1-G10 gates; rewriting and iteration are performed by isolated fulfil sub-agents via dispatch task cards; after convergence a context-free blind-judge round (G10) is mandatory, while the main agent only orchestrates files. No external LLM SDK client required; semantic quality is delivered by templates and sub-agents, and finalized by real-use-case acceptance. Trigger words: optimize prompt, rewrite prompt, structure this prompt better, prompt engineering, LangGPT, make my prompt better, improve this system prompt."
 agent_created: true
 ---
 
